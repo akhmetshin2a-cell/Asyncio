@@ -1,13 +1,16 @@
 """Дни 1–7. Банковская система, отчёты и визуализация.
 
-Запуск демонстрации: python3 day1.py
+Запуск демонстрации: python3 OOP_Project.py
 Денежные суммы передавайте строками, целыми числами или Decimal.
+Максимальная сумма и стоимость активов одного счёта: 999999999999999999.99.
+Денежные операции банковских счетов проходят через обработчик, риск и аудит.
+Очередь и журнал рассчитаны на один поток; состояние банка хранится в памяти.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP, localcontext
 from enum import Enum
 from uuid import uuid4
 from datetime import datetime, timedelta
@@ -16,7 +19,11 @@ from hashlib import pbkdf2_hmac
 from secrets import token_bytes, token_urlsafe, compare_digest
 from pathlib import Path
 from copy import deepcopy
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, NamedTemporaryFile
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
+import os
 import json
 import csv
 
@@ -37,6 +44,33 @@ class InsufficientFundsError(InvalidOperationError):
     """На счёте недостаточно средств."""
 
 
+MAX_MONEY = Decimal("999999999999999999.99")
+_account_access = ContextVar("account_access", default=None)
+
+
+def money_calculation(method):
+    """Точность денежных расчётов не зависит от внешнего Decimal-контекста."""
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        with localcontext() as context:
+            context.prec = 50
+            context.rounding = ROUND_HALF_UP
+            try:
+                return method(*args, **kwargs)
+            except DecimalException as error:
+                raise InvalidOperationError("Сумма выходит за допустимый диапазон расчётов.") from error
+    return wrapped
+
+
+@contextmanager
+def _access_accounts(bank):
+    token = _account_access.set(bank._account_token)
+    try:
+        yield
+    finally:
+        _account_access.reset(token)
+
+
 class AccountStatus(Enum):
     ACTIVE = "активный"
     FROZEN = "замороженный"
@@ -52,9 +86,11 @@ class AbstractAccount(ABC):
         self._owner = owner
         self._balance = balance
         self._status = status
+        self._bank_token = None
 
-    def new_method(self, status):
-        self._status = status
+    def _check_mutation_access(self):
+        if self._bank_token is not None and _account_access.get() is not self._bank_token:
+            raise InvalidOperationError("Используйте методы банка или обработчик транзакций.")
 
     @property
     def account_id(self) -> str:
@@ -127,6 +163,7 @@ class BankAccount(AbstractAccount):
         return self._currency
 
     @staticmethod
+    @money_calculation
     def _validate_amount(amount, *, allow_zero: bool = False) -> Decimal:
         # bool — подкласс int, но True и False не считаем денежными суммами.
         if isinstance(amount, bool) or not isinstance(amount, (str, int, Decimal)):
@@ -141,7 +178,9 @@ class BankAccount(AbstractAccount):
             raise InvalidOperationError("Сумма должна быть положительной; начальный баланс может быть нулём.")
         if value.as_tuple().exponent < -2:
             raise InvalidOperationError("Допускается не более двух знаков после запятой.")
-        return value
+        if value > MAX_MONEY:
+            raise InvalidOperationError(f"Сумма не должна превышать {MAX_MONEY}.")
+        return value.quantize(Decimal("0.01"))
 
     def _check_active(self) -> None:
         if self.status is AccountStatus.FROZEN:
@@ -149,12 +188,21 @@ class BankAccount(AbstractAccount):
         if self.status is AccountStatus.CLOSED:
             raise AccountClosedError("Операция запрещена: счёт закрыт.")
 
+    @money_calculation
     def deposit(self, amount) -> None:
+        self._check_mutation_access()
         self._check_active()
         value = self._validate_amount(amount)
-        self._balance += value
+        new_balance = self._balance + value
+        # Для инвестиционного счёта ограничивается и общая стоимость активов.
+        assets = sum(getattr(self, "_portfolio", {}).values(), Decimal("0"))
+        if abs(new_balance) > MAX_MONEY or new_balance + assets > MAX_MONEY:
+            raise InvalidOperationError("Превышен максимальный баланс или стоимость активов счёта.")
+        self._balance = new_balance
 
+    @money_calculation
     def withdraw(self, amount) -> None:
+        self._check_mutation_access()
         self._check_active()
         value = self._validate_amount(amount)
         if value > self.balance:
@@ -162,10 +210,12 @@ class BankAccount(AbstractAccount):
         self._balance -= value
 
     def freeze(self) -> None:
+        self._check_mutation_access()
         self._check_active()
         self._status = AccountStatus.FROZEN
 
     def unfreeze(self) -> None:
+        self._check_mutation_access()
         if self.status is AccountStatus.CLOSED:
             raise AccountClosedError("Закрытый счёт нельзя разморозить.")
         if self.status is not AccountStatus.FROZEN:
@@ -173,6 +223,7 @@ class BankAccount(AbstractAccount):
         self._status = AccountStatus.ACTIVE
 
     def close(self) -> None:
+        self._check_mutation_access()
         self._check_active()
         if self.balance != 0:
             raise InvalidOperationError("Перед закрытием снимите все средства.")
@@ -251,6 +302,7 @@ def demonstrate() -> None:
 # Ставки задаются долями единицы: "0.10" означает 10%.
 
 
+@money_calculation
 def validate_rate(rate):
     if isinstance(rate, bool) or not isinstance(rate, (str, int, Decimal)):
         raise InvalidOperationError("Ставка должна быть строкой, int или Decimal.")
@@ -260,6 +312,8 @@ def validate_rate(rate):
         raise InvalidOperationError("Некорректная ставка.") from None
     if not value.is_finite() or not 0 <= value <= 1:
         raise InvalidOperationError("Ставка должна быть от 0 до 1.")
+    if value.as_tuple().exponent < -12:
+        raise InvalidOperationError("В ставке допускается не более 12 знаков после запятой.")
     return value
 
 
@@ -270,6 +324,8 @@ class SavingsAccount(BankAccount):
         minimum = self._validate_amount(min_balance, allow_zero=True)
         initial = self._validate_amount(balance, allow_zero=True)
         rate = validate_rate(monthly_rate)
+        if initial < minimum:
+            raise InvalidOperationError("Начальный баланс не может быть ниже минимального остатка.")
         super().__init__(owner, initial, currency, status, account_id)
         self._min_balance = minimum
         self._monthly_rate = rate
@@ -282,7 +338,9 @@ class SavingsAccount(BankAccount):
     def monthly_rate(self):
         return self._monthly_rate
 
+    @money_calculation
     def withdraw(self, amount):
+        self._check_mutation_access()
         self._check_active()
         value = self._validate_amount(amount)
         if value > self.balance:
@@ -291,7 +349,9 @@ class SavingsAccount(BankAccount):
             raise InvalidOperationError("Снятие нарушит минимальный остаток.")
         super().withdraw(value)
 
+    @money_calculation
     def apply_monthly_interest(self):
+        self._check_mutation_access()
         # Один вызов — один условный месяц, без привязки к календарю.
         self._check_active()
         interest = (self.balance * self.monthly_rate).quantize(
@@ -335,7 +395,9 @@ class PremiumAccount(BankAccount):
     def fee(self):
         return self._fee
 
+    @money_calculation
     def withdraw(self, amount):
+        self._check_mutation_access()
         self._check_active()
         value = self._validate_amount(amount)
         if value > self.withdrawal_limit:
@@ -369,7 +431,9 @@ class InvestmentAccount(BankAccount):
     def portfolio(self):
         return self._portfolio.copy()
 
+    @money_calculation
     def invest(self, asset_type, amount):
+        self._check_mutation_access()
         self._check_active()
         if not isinstance(asset_type, str) or asset_type not in self.ALLOWED_ASSETS:
             raise InvalidOperationError("Допустимые активы: stocks, bonds, etf.")
@@ -379,13 +443,16 @@ class InvestmentAccount(BankAccount):
         self._balance -= value
         self._portfolio[asset_type] += value
 
+    @money_calculation
     def withdraw(self, amount):
+        self._check_mutation_access()
         self._check_active()
         value = self._validate_amount(amount)
         if value > self.balance:
             raise InsufficientFundsError("Снять можно только свободные деньги.")
         super().withdraw(value)
 
+    @money_calculation
     def project_yearly_growth(self, growth_rates):
         # Это прогноз прироста, а не начисление денег на счёт.
         if not isinstance(growth_rates, dict):
@@ -404,11 +471,13 @@ class InvestmentAccount(BankAccount):
         return growth.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     def close(self):
+        self._check_mutation_access()
         self._check_active()
         if any(self._portfolio.values()):
             raise InvalidOperationError("Нельзя закрыть счёт с непустым портфелем.")
         super().close()
 
+    @money_calculation
     def get_account_info(self):
         info = super().get_account_info()
         invested = sum(self._portfolio.values(), Decimal("0"))
@@ -568,7 +637,7 @@ class Bank:
         "investment": InvestmentAccount,
     }
 
-    def __init__(self, name, clock=None):
+    def __init__(self, name, clock=None, *, audit=None, risk_analyzer=None):
         if not isinstance(name, str) or not name.strip():
             raise InvalidOperationError("Название банка должно быть непустым.")
         self.name = name.strip()
@@ -580,6 +649,43 @@ class Bank:
         self._failed_attempts = {}
         self._sessions = {}
         self._security_events = []
+        self._account_token = object()
+        self._completed_transactions = {}
+        self._transactions = {}
+        self._processor = None
+        self._audit = audit if audit is not None else (
+            risk_analyzer.audit if risk_analyzer is not None else AuditLog(clock=self._clock))
+        self._risk_analyzer = risk_analyzer or RiskAnalyzer(self._audit, clock=self._clock)
+        if not isinstance(self._audit, AuditLog) or not isinstance(self._risk_analyzer, RiskAnalyzer):
+            raise InvalidOperationError("Нужны AuditLog и RiskAnalyzer.")
+        if self._risk_analyzer.audit is not self._audit:
+            raise InvalidOperationError("Банк и анализатор должны использовать один аудит.")
+
+    @property
+    def audit(self):
+        return self._audit
+
+    @property
+    def risk_analyzer(self):
+        return self._risk_analyzer
+
+    @property
+    def transactions(self):
+        return tuple(self._transactions.values())
+
+    def _get_processor(self):
+        if self._processor is None:
+            TransactionProcessor(self, TransactionQueue(self._clock), clock=self._clock)
+        return self._processor
+
+    def _perform_transaction(self, session, account_id, kind, amount, **settings):
+        _, account = self._owned_account(session, account_id, kind.value)
+        transaction = Transaction(kind, amount, account.currency, session=session,
+                                  clock=self._clock, **settings)
+        self._get_processor().execute_now(transaction)
+        if transaction.status is not TransactionStatus.COMPLETED:
+            raise transaction._last_error
+        return transaction
 
     @property
     def security_events(self):
@@ -672,6 +778,7 @@ class Bank:
         except TypeError as error:
             raise InvalidOperationError(f"Неверные параметры счёта: {error}") from None
         self._accounts[account.account_id] = account
+        account._bank_token = self._account_token
         self._owners[account.account_id] = client.client_id
         client._account_ids.append(account.account_id)
         return account.account_id
@@ -679,7 +786,8 @@ class Bank:
     def _change_account(self, session, account_id, method, *args):
         client, account = self._owned_account(session, account_id, method)
         self._check_daytime(client.client_id, method)
-        return getattr(account, method)(*args)
+        with _access_accounts(self):
+            return getattr(account, method)(*args)
 
     def close_account(self, session, account_id):
         return self._change_account(session, account_id, "close")
@@ -691,22 +799,33 @@ class Bank:
         return self._change_account(session, account_id, "unfreeze")
 
     def deposit(self, session, account_id, amount):
-        return self._change_account(session, account_id, "deposit", amount)
+        self._perform_transaction(session, account_id, TransactionType.DEPOSIT, amount,
+                                  recipient=account_id)
 
     def withdraw(self, session, account_id, amount):
-        return self._change_account(session, account_id, "withdraw", amount)
+        self._perform_transaction(session, account_id, TransactionType.WITHDRAWAL, amount,
+                                  sender=account_id)
 
     def invest(self, session, account_id, asset_type, amount):
         _, account = self._owned_account(session, account_id, "invest")
         if not isinstance(account, InvestmentAccount):
             raise InvalidOperationError("Инвестировать можно только с инвестиционного счёта.")
-        return self._change_account(session, account_id, "invest", asset_type, amount)
+        self._perform_transaction(session, account_id, TransactionType.INVESTMENT, amount,
+                                  sender=account_id, asset_type=asset_type)
 
+    @money_calculation
     def apply_monthly_interest(self, session, account_id):
         _, account = self._owned_account(session, account_id, "interest")
         if not isinstance(account, SavingsAccount):
             raise InvalidOperationError("Месячные проценты доступны накопительному счёту.")
-        return self._change_account(session, account_id, "apply_monthly_interest")
+        self._check_daytime(self._sessions[session], "interest")
+        account._check_active()
+        amount = (account.balance * account.monthly_rate).quantize(Decimal("0.01"))
+        if amount == 0:
+            return amount
+        transaction = self._perform_transaction(
+            session, account_id, TransactionType.INTEREST, amount, recipient=account_id)
+        return transaction.recipient_amount
 
     def search_accounts(self, session, *, account_id=None, currency=None, status=None):
         client = self._authorize(session)
@@ -726,6 +845,7 @@ class Bank:
             result.append(account.get_account_info())
         return result
 
+    @money_calculation
     def get_total_balance(self):
         # Управленческая сводка: валюты не складываются между собой.
         # Включены замороженные счета, овердрафт вычитается, портфель учитывается.
@@ -736,6 +856,7 @@ class Bank:
                 totals[account.currency] += info.get("total_assets", account.balance)
         return totals
 
+    @money_calculation
     def get_clients_ranking(self):
         # Отдельный рейтинг для каждой валюты, без выдуманного обменного курса.
         ranking = {}
@@ -786,12 +907,12 @@ def demonstrate_day3():
     expect_error(ClientBlockedError, bank.authenticate_client, vera.client_id, "учебный-пароль")
     expect_error(AuthenticationError, bank.open_account, vera_session)
     assert vera.status is ClientStatus.BLOCKED
-    current[0] = datetime(2026, 10, 12, 0, 0)
-    expect_error(NightOperationError, bank.deposit, anna_session, anna_account, "10")
-    current[0] = datetime(2026, 10, 12, 4, 59)
+    current[0] = datetime(2026, 10, 13, 0, 0)
+    expect_error(RiskBlockedError, bank.deposit, anna_session, anna_account, "10")
+    current[0] = datetime(2026, 10, 13, 4, 59)
     expect_error(NightOperationError, bank.open_account, anna_session)
     assert bank.search_accounts(anna_session, account_id=anna_account)[0]["balance"] == Decimal("1050")
-    current[0] = datetime(2026, 10, 12, 5, 0)
+    current[0] = datetime(2026, 10, 13, 5, 0)
     bank.deposit(anna_session, anna_account, "10")
     assert bank.get_total_balance()["RUB"] == Decimal("3560")
     assert bank.get_total_balance()["USD"] == Decimal("300")
@@ -823,6 +944,8 @@ class TransactionType(Enum):
     EXTERNAL_TRANSFER = "внешний перевод"
     DEPOSIT = "пополнение"
     WITHDRAWAL = "снятие"
+    INVESTMENT = "инвестирование"
+    INTEREST = "начисление процентов"
 
 
 class TransactionStatus(Enum):
@@ -840,8 +963,35 @@ class TemporaryTransactionError(Exception):
 
 
 class Transaction:
+    _TRANSITIONS = {
+        TransactionStatus.CREATED: {TransactionStatus.QUEUED},
+        TransactionStatus.QUEUED: {TransactionStatus.PROCESSING, TransactionStatus.CANCELLED},
+        TransactionStatus.RETRY: {TransactionStatus.PROCESSING, TransactionStatus.CANCELLED},
+        TransactionStatus.PROCESSING: {TransactionStatus.RETRY, TransactionStatus.COMPLETED,
+                                       TransactionStatus.FAILED},
+    }
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False) and not name.startswith("_"):
+            raise AttributeError(f"Поле транзакции {name} доступно только для чтения.")
+        object.__setattr__(self, name, value)
+
+    def _update(self, **changes):
+        for name, value in changes.items():
+            object.__setattr__(self, name, value)
+
+    def _transition(self, status, now, **changes):
+        if status not in self._TRANSITIONS.get(self.status, set()):
+            raise InvalidOperationError("Недопустимый переход статуса транзакции.")
+        self._update(status=status, updated_at=now, **changes)
+
+    @property
+    def errors(self):
+        return deepcopy(self._errors)
+
     def __init__(self, transaction_type, amount, currency, *, sender=None,
-                 recipient=None, session=None, priority=0, scheduled_at=None, clock=None):
+                 recipient=None, session=None, priority=0, scheduled_at=None, clock=None,
+                 asset_type=None):
         if not isinstance(transaction_type, TransactionType):
             raise InvalidOperationError("Тип должен быть TransactionType.")
         if not isinstance(currency, str) or currency.upper() not in BankAccount.ALLOWED_CURRENCIES:
@@ -856,15 +1006,17 @@ class Transaction:
             if (scheduled_at.utcoffset() is None) != (now.utcoffset() is None):
                 raise InvalidOperationError("Время операции и часы должны иметь совместимые часовые пояса.")
         if transaction_type in (TransactionType.TRANSFER, TransactionType.EXTERNAL_TRANSFER,
-                                TransactionType.WITHDRAWAL):
+                                TransactionType.WITHDRAWAL, TransactionType.INVESTMENT):
             if not isinstance(sender, str) or not sender.strip():
                 raise InvalidOperationError("Укажите номер счёта отправителя.")
         if transaction_type in (TransactionType.TRANSFER, TransactionType.EXTERNAL_TRANSFER,
-                                TransactionType.DEPOSIT):
+                                TransactionType.DEPOSIT, TransactionType.INTEREST):
             if not isinstance(recipient, str) or not recipient.strip():
                 raise InvalidOperationError("Укажите получателя.")
         if transaction_type is TransactionType.TRANSFER and sender == recipient:
             raise InvalidOperationError("Нельзя переводить на тот же счёт.")
+        if transaction_type is TransactionType.INVESTMENT and asset_type not in InvestmentAccount.ALLOWED_ASSETS:
+            raise InvalidOperationError("Неизвестный тип актива.")
         self.transaction_id = uuid4().hex
         self.type = transaction_type
         self.amount = BankAccount._validate_amount(amount)
@@ -873,6 +1025,7 @@ class Transaction:
         self.recipient_amount = Decimal("0")
         self.sender = sender
         self.recipient = recipient
+        self.asset_type = asset_type
         self._session = session
         self.priority = priority
         self.status = TransactionStatus.CREATED
@@ -882,7 +1035,18 @@ class Transaction:
         self.scheduled_at = scheduled_at if scheduled_at is not None else now
         self.completed_at = None
         self.attempts = 0
-        self.errors = []
+        self._errors = []
+        self._last_error = None
+        self._sealed = True
+
+    def _validate_for_execution(self):
+        if not isinstance(self.type, TransactionType):
+            raise InvalidOperationError("Неизвестный тип транзакции.")
+        BankAccount._validate_amount(self.amount)
+        if self.currency not in BankAccount.ALLOWED_CURRENCIES:
+            raise InvalidOperationError("Неизвестная валюта транзакции.")
+        if self.type is TransactionType.TRANSFER and self.sender == self.recipient:
+            raise InvalidOperationError("Нельзя переводить на тот же счёт.")
 
     def __str__(self):
         return (f"Transaction {self.transaction_id[:8]} | {self.type.value} | "
@@ -912,8 +1076,7 @@ class TransactionQueue:
             raise InvalidOperationError("Несовместимые часовые пояса очереди и транзакции.")
         self._items[transaction.transaction_id] = (self._sequence, transaction)
         self._sequence += 1
-        transaction.status = TransactionStatus.QUEUED
-        transaction.updated_at = now
+        transaction._transition(TransactionStatus.QUEUED, now)
 
     def cancel(self, transaction_id):
         item = self._items.get(transaction_id)
@@ -922,9 +1085,8 @@ class TransactionQueue:
         transaction = item[1]
         if transaction.status not in (TransactionStatus.QUEUED, TransactionStatus.RETRY):
             raise InvalidOperationError("Отменить можно только ожидающую транзакцию.")
-        transaction.status = TransactionStatus.CANCELLED
-        transaction.updated_at = self._clock()
-        transaction.failure_reason = "Отменена до исполнения"
+        transaction._transition(TransactionStatus.CANCELLED, self._clock(),
+                                failure_reason="Отменена до исполнения")
 
     def ready(self):
         now = self._clock()
@@ -958,40 +1120,67 @@ class TransactionProcessor:
         self.currency_values = {currency: BankAccount._validate_amount(value)
                                 for currency, value in values.items()}
         self.before_execute = before_execute
-        self.audit = audit if audit is not None else (risk_analyzer.audit if risk_analyzer is not None else None)
-        self.risk_analyzer = risk_analyzer
-        if risk_analyzer is not None and self.audit is not risk_analyzer.audit:
+        if audit is not None and not isinstance(audit, AuditLog):
+            raise InvalidOperationError("Передайте AuditLog.")
+        if risk_analyzer is not None and not isinstance(risk_analyzer, RiskAnalyzer):
+            raise InvalidOperationError("Передайте RiskAnalyzer.")
+        self.audit = audit if audit is not None else (
+            risk_analyzer.audit if risk_analyzer is not None else bank.audit)
+        self.risk_analyzer = risk_analyzer or (
+            bank.risk_analyzer if self.audit is bank.audit else RiskAnalyzer(self.audit, clock=self._clock))
+        if self.audit is not self.risk_analyzer.audit:
             raise InvalidOperationError("Анализатор и обработчик должны использовать один аудит.")
         self.error_log = []
         self.execution_order = []
+        bank._audit = self.audit
+        bank._risk_analyzer = self.risk_analyzer
+        bank._processor = self
 
+    @money_calculation
     def convert(self, amount, source, target):
         return (amount * self.currency_values[source] / self.currency_values[target]).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+    @money_calculation
     def _execute(self, transaction):
         t = transaction
+        t._validate_for_execution()
+        if t.transaction_id in self.bank._completed_transactions:
+            raise InvalidOperationError("Транзакция уже проведена.")
         client = self.bank._authorize(t._session)
-        if self.risk_analyzer is not None:
-            amount_rub = self.convert(t.amount, t.currency, "RUB")
-            level, assessment = self.risk_analyzer.assess(t, client.client_id, amount_rub)
-            if level is RiskLevel.HIGH:
-                self.bank._flag(client.client_id, "transaction", "; ".join(assessment["reasons"]))
-                raise RiskBlockedError("Высокий риск: " + "; ".join(assessment["reasons"]))
-        self.bank._check_daytime(client.client_id, "transaction")
-        if t.type is TransactionType.DEPOSIT:
-            _, recipient = self.bank._owned_account(t._session, t.recipient, "deposit")
-            recipient._check_active()
-            if recipient.currency != t.currency:
-                raise InvalidOperationError("Валюта пополнения должна совпадать с валютой счёта.")
-            recipient.deposit(t.amount)
-            t.recipient_amount = t.amount
-            return
-
-        _, sender = self.bank._owned_account(t._session, t.sender, "transaction")
-        sender._check_active()
-        if sender.currency != t.currency:
+        incoming = t.type in (TransactionType.DEPOSIT, TransactionType.INTEREST)
+        _, account = self.bank._owned_account(
+            t._session, t.recipient if incoming else t.sender, "transaction")
+        account._check_active()
+        if account.currency != t.currency:
             raise InvalidOperationError("Сумма и комиссия задаются в валюте отправителя.")
+        amount_rub = self.convert(t.amount, t.currency, "RUB")
+        level, assessment = self.risk_analyzer.assess(t, client.client_id, amount_rub)
+        if level is RiskLevel.HIGH:
+            self.bank._flag(client.client_id, "transaction", "; ".join(assessment["reasons"]))
+            raise RiskBlockedError("Высокий риск: " + "; ".join(assessment["reasons"]))
+        self.bank._check_daytime(client.client_id, "transaction")
+        if incoming:
+            if t.type is TransactionType.INTEREST:
+                if not isinstance(account, SavingsAccount):
+                    raise InvalidOperationError("Начисление процентов доступно накопительному счёту.")
+                expected = (account.balance * account.monthly_rate).quantize(Decimal("0.01"))
+                if t.amount != expected:
+                    raise InvalidOperationError("Сумма процентов не соответствует текущему балансу и ставке.")
+            with _access_accounts(self.bank):
+                account.deposit(t.amount)
+            t._update(recipient_amount=t.amount)
+            return
+        if t.type is TransactionType.INVESTMENT:
+            if not isinstance(account, InvestmentAccount):
+                raise InvalidOperationError("Нужен инвестиционный счёт.")
+            with _access_accounts(self.bank):
+                account.invest(t.asset_type, t.amount)
+            return
+        if t.type not in (TransactionType.WITHDRAWAL, TransactionType.TRANSFER,
+                           TransactionType.EXTERNAL_TRANSFER):
+            raise InvalidOperationError("Неизвестный тип транзакции.")
+        sender = account
         if sender.balance < 0 and not isinstance(sender, PremiumAccount):
             raise InvalidOperationError("Перевод с отрицательного баланса запрещён.")
         recipient = None
@@ -1013,67 +1202,93 @@ class TransactionProcessor:
                 Decimal("0.01"), rounding=ROUND_HALF_UP)
         premium_fee = sender.fee if isinstance(sender, PremiumAccount) else Decimal("0")
         # withdraw премиального счёта самостоятельно добавляет свою комиссию.
-        t.fee = external_fee + premium_fee
+        t._update(fee=external_fee + premium_fee)
         sender_before = sender.balance
         recipient_before = recipient.balance if recipient is not None else None
         try:
-            sender.withdraw(t.amount + external_fee)
-            if recipient is not None:
-                recipient.deposit(converted)
+            with _access_accounts(self.bank):
+                sender.withdraw(t.amount + external_fee)
+                if recipient is not None:
+                    recipient.deposit(converted)
         except Exception:
             # Атомарность в памяти: при ошибке зачисления возвращаем оба баланса.
             sender._balance = sender_before
             if recipient is not None:
                 recipient._balance = recipient_before
             raise
-        t.recipient_amount = converted if recipient is not None else (
-            t.amount if t.type is TransactionType.EXTERNAL_TRANSFER else Decimal("0"))
+        t._update(recipient_amount=converted if recipient is not None else (
+            t.amount if t.type is TransactionType.EXTERNAL_TRANSFER else Decimal("0")))
+
+    def _record_audit(self, level, event, **details):
+        before = len(self.audit._records)
+        try:
+            self.audit.record(level, event, **details)
+        except Exception as error:
+            # Даже нестандартный журнал не должен отменять уже проведённые деньги.
+            if len(self.audit._records) == before:
+                self.audit._defer(level, event, **details)
+            self.audit._note_write_error(error)
+
+    def execute_now(self, transaction):
+        """Синхронный путь Bank использует тот же обработчик и тот же риск."""
+        if transaction.scheduled_at > self._clock():
+            raise InvalidOperationError("Отложенную операцию нельзя провести немедленно.")
+        self.queue.add(transaction)
+        return self._process_transaction(transaction)
+
+    def _process_transaction(self, t):
+        if t.transaction_id in self.bank._completed_transactions:
+            raise InvalidOperationError("Транзакция уже проведена.")
+        if t.status not in (TransactionStatus.QUEUED, TransactionStatus.RETRY):
+            raise InvalidOperationError("Операция не ожидает исполнения.")
+        registered = self.bank._transactions.get(t.transaction_id)
+        if registered is not None and registered is not t:
+            raise InvalidOperationError("ID уже принадлежит другой транзакции.")
+        self.bank._transactions[t.transaction_id] = t
+        t._transition(TransactionStatus.PROCESSING, self._clock(), attempts=t.attempts + 1)
+        self.execution_order.append(t.transaction_id)
+        try:
+            if self.before_execute is not None:
+                self.before_execute(t)
+            self._execute(t)
+        except Exception as error:
+            record = {"transaction_id": t.transaction_id, "attempt": t.attempts,
+                      "time": self._clock().isoformat(), "error_type": type(error).__name__,
+                      "message": str(error)}
+            t._errors.append(record.copy())
+            self.error_log.append(record)
+            t._last_error = error
+            if isinstance(error, TemporaryTransactionError) and t.attempts < self.max_attempts:
+                t._transition(TransactionStatus.RETRY, self._clock(), failure_reason=str(error),
+                              scheduled_at=self._clock() + timedelta(seconds=self.retry_delay))
+            else:
+                t._transition(TransactionStatus.FAILED, self._clock(), failure_reason=str(error))
+            self._record_audit(AuditLevel.ERROR, "transaction_error",
+                               client_id=self.bank._sessions.get(t._session),
+                               transaction_id=t.transaction_id, details=record)
+        else:
+            # Реестр фиксируется ДО журналирования: сбой файла не разрешит повтор денег.
+            completed = self._clock()
+            self.bank._completed_transactions[t.transaction_id] = completed
+            t._last_error = None
+            t._transition(TransactionStatus.COMPLETED, completed,
+                          failure_reason=None, completed_at=completed)
+            client_id = self.bank._sessions.get(t._session)
+            self.risk_analyzer.mark_completed(t, client_id)
+            related = []
+            if t.type is TransactionType.TRANSFER:
+                related.append(self.bank._owners[t.recipient])
+            self._record_audit(AuditLevel.INFO, "transaction_completed", client_id=client_id,
+                               related_client_ids=related, transaction_id=t.transaction_id,
+                               details={"type": t.type.value, "amount": str(t.amount),
+                                        "currency": t.currency, "fee": str(t.fee),
+                                        "sender": t.sender, "recipient": t.recipient,
+                                        "recipient_amount": str(t.recipient_amount),
+                                        "attempts": t.attempts})
+        return t
 
     def process_ready(self):
-        processed = []
-        for transaction in self.queue.ready():
-            t = transaction
-            t.status = TransactionStatus.PROCESSING
-            t.attempts += 1
-            t.updated_at = self._clock()
-            self.execution_order.append(t.transaction_id)
-            try:
-                # Тестовый источник временного сбоя вызывается ДО списания.
-                if self.before_execute is not None:
-                    self.before_execute(t)
-                self._execute(t)
-            except Exception as error:
-                record = {"transaction_id": t.transaction_id, "attempt": t.attempts,
-                          "time": self._clock().isoformat(), "error_type": type(error).__name__,
-                          "message": str(error)}
-                t.errors.append(record.copy())
-                self.error_log.append(record)
-                t.failure_reason = str(error)
-                if isinstance(error, TemporaryTransactionError) and t.attempts < self.max_attempts:
-                    t.status = TransactionStatus.RETRY
-                    t.scheduled_at = self._clock() + timedelta(seconds=self.retry_delay)
-                else:
-                    t.status = TransactionStatus.FAILED
-                t.updated_at = self._clock()
-                if self.audit is not None:
-                    self.audit.record(AuditLevel.ERROR, "transaction_error",
-                                      client_id=self.bank._sessions.get(t._session),
-                                      transaction_id=t.transaction_id, details=record)
-            else:
-                t.status = TransactionStatus.COMPLETED
-                t.failure_reason = None
-                t.completed_at = self._clock()
-                t.updated_at = t.completed_at
-                client_id = self.bank._sessions.get(t._session)
-                if self.risk_analyzer is not None:
-                    self.risk_analyzer.mark_completed(t, client_id)
-                if self.audit is not None:
-                    self.audit.record(AuditLevel.INFO, "transaction_completed", client_id=client_id,
-                                      transaction_id=t.transaction_id,
-                                      details={"amount": str(t.amount), "currency": t.currency,
-                                               "fee": str(t.fee), "attempts": t.attempts})
-            processed.append(t)
-        return processed
+        return [self._process_transaction(t) for t in self.queue.ready()]
 
 
 def demonstrate_day4():
@@ -1119,7 +1334,12 @@ def demonstrate_day4():
         if transaction is transactions[8] and transaction.attempts == 1:
             raise TemporaryTransactionError("Учебный временный сбой")
 
-    processor = TransactionProcessor(bank, queue, clock=clock, before_execute=temporary_failure)
+    # Здесь показываем очередь и комиссии. Стандартный порог частоты (5)
+    # отдельно проверяется в дне 5; для пакета дня 4 используем порог 100.
+    audit = AuditLog(clock=clock)
+    risk = RiskAnalyzer(audit, frequency_limit=100, clock=clock)
+    processor = TransactionProcessor(bank, queue, clock=clock, before_execute=temporary_failure,
+                                     audit=audit, risk_analyzer=risk)
     processor.process_ready()
     assert processor.execution_order[:2] == [transactions[1].transaction_id, transactions[0].transaction_id]
     assert transactions[6].status is TransactionStatus.QUEUED
@@ -1174,31 +1394,88 @@ class RiskBlockedError(InvalidOperationError):
 class AuditLog:
     """JSONL: одна JSON-запись на строку. Пароли и сессии не записываем.
 
-    Если запись в файл не удалась, исключение не скрывается.
+    Событие сначала сохраняется в памяти. Ошибка файла видна в write_errors,
+    несохранённые события — в pending_count. flush() повторяет только запись
+    журнала, а не денежную операцию. Файл обновляется атомарной заменой.
     Фильтрация относится к записям текущего экземпляра в памяти.
+    Одновременная запись из нескольких процессов не поддерживается.
     """
     def __init__(self, file_path=None, clock=None):
         self._clock = clock or (lambda: datetime.now(ZoneInfo("Europe/Moscow")))
         self._records = []
+        self._pending = []
+        self._write_errors = []
         self._file_path = Path(file_path) if file_path is not None else None
         if self._file_path is not None:
             self._file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def record(self, level, event, *, client_id=None, transaction_id=None, details=None):
+    @property
+    def pending_count(self):
+        return len(self._pending)
+
+    @property
+    def write_errors(self):
+        return deepcopy(self._write_errors)
+
+    def _note_write_error(self, error):
+        self._write_errors.append({"timestamp": self._clock().isoformat(),
+                                   "error_type": type(error).__name__, "message": str(error)})
+
+    def _defer(self, level, event, *, client_id=None, transaction_id=None, details=None,
+               related_client_ids=None):
         if not isinstance(level, AuditLevel):
             raise InvalidOperationError("Укажите AuditLevel.")
         if not isinstance(event, str) or not event.strip():
             raise InvalidOperationError("Название события должно быть непустым.")
-        entry = {"timestamp": self._clock().isoformat(), "level": level.value,
+        entry = {"event_id": uuid4().hex,
+                 "timestamp": self._clock().isoformat(), "level": level.value,
                  "event": event, "client_id": client_id, "transaction_id": transaction_id,
+                 "related_client_ids": list(dict.fromkeys(related_client_ids or [])),
                  "details": deepcopy(details) if details is not None else {}}
-        # Сначала файл: сбой записи не создаёт ложного успеха в памяти.
-        serialized = json.dumps(entry, ensure_ascii=False, allow_nan=False)
-        if self._file_path is not None:
-            with self._file_path.open("a", encoding="utf-8") as stream:
-                stream.write(serialized + "\n")
+        json.dumps(entry, ensure_ascii=False, allow_nan=False)
         self._records.append(entry)
+        if self._file_path is not None:
+            self._pending.append(entry)
         return deepcopy(entry)
+
+    def record(self, level, event, *, client_id=None, transaction_id=None, details=None,
+               related_client_ids=None):
+        entry = self._defer(level, event, client_id=client_id, transaction_id=transaction_id,
+                            details=details, related_client_ids=related_client_ids)
+        self.flush()
+        return entry
+
+    def flush(self):
+        """True — все события записаны; False — остались в памяти для повтора."""
+        if self._file_path is None or not self._pending:
+            return True
+        temporary = None
+        try:
+            existing = self._file_path.read_text(encoding="utf-8") if self._file_path.exists() else ""
+            known = {json.loads(line).get("event_id") for line in existing.splitlines() if line.strip()}
+            entries = [entry for entry in self._pending if entry["event_id"] not in known]
+            addition = "".join(json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n"
+                               for entry in entries)
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            with NamedTemporaryFile(mode="w", encoding="utf-8", dir=self._file_path.parent,
+                                    prefix=".audit-", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(existing + addition)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._file_path)
+            self._pending.clear()
+            return True
+        except (OSError, ValueError) as error:
+            self._note_write_error(error)
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as error:
+                    self._note_write_error(error)
 
     def filter(self, *, level=None, event=None, client_id=None,
                transaction_id=None, since=None, until=None):
@@ -1210,7 +1487,8 @@ class AuditLog:
                 continue
             if event is not None and entry["event"] != event:
                 continue
-            if client_id is not None and entry["client_id"] != client_id:
+            if (client_id is not None and entry["client_id"] != client_id
+                    and client_id not in entry.get("related_client_ids", [])):
                 continue
             if transaction_id is not None and entry["transaction_id"] != transaction_id:
                 continue
@@ -1393,7 +1671,6 @@ def demonstrate_day6(output_dir=None, *, return_context=False):
     audit = AuditLog(audit_path, clock)
     risk = RiskAnalyzer(audit, clock=clock)
     queue = TransactionQueue(clock)
-    processor = TransactionProcessor(bank, queue, audit=audit, risk_analyzer=risk, clock=clock)
     clients, sessions, accounts = [], [], []
     names = ["Анна Иванова", "Борис Петров", "Вера Сидорова",
              "Глеб Орлов", "Дарья Смирнова", "Егор Волков"]
@@ -1414,6 +1691,8 @@ def demonstrate_day6(output_dir=None, *, return_context=False):
     assert len(bank._clients) == 6 and len(bank._accounts) == 12
     bank.freeze_account(sessions[5], accounts[5][1])
     initial_total = bank.get_total_balance()["RUB"]
+    # Аудит симуляции начинается после формирования начальных портфелей.
+    processor = TransactionProcessor(bank, queue, audit=audit, risk_analyzer=risk, clock=clock)
     balance_history = [{"timestamp": clock().isoformat(), "totals": bank.get_total_balance()}]
     transactions = []
 
@@ -1584,6 +1863,7 @@ class ReportBuilder:
                 "created_at": transaction.created_at.isoformat(),
                 "completed_at": transaction.completed_at.isoformat() if transaction.completed_at else None}
 
+    @money_calculation
     def build_client_report(self, client_id):
         client = self.bank._get_client(client_id)
         numbers = set(client.account_ids)
@@ -1617,6 +1897,8 @@ class ReportBuilder:
                                   for row in self.risk_analyzer._assessments.values())
                   for level in RiskLevel}
         return {"report_type": "risks", "assessment_counts": levels,
+                "unassessed_transaction_count": sum(
+                    t.transaction_id not in self.risk_analyzer._assessments for t in self.transactions),
                 "suspicious_operations": self.audit.suspicious_operations(),
                 "client_risk_profiles": profiles, "error_statistics": self.audit.error_statistics()}
 
@@ -1694,7 +1976,7 @@ class ReportBuilder:
         else:
             ax.text(0.5, 0.5, "Нет оценённых операций", ha="center", va="center")
             ax.axis("off")
-        ax.set_title("Распределение операций по уровню риска")
+        ax.set_title("Распределение оценённых операций по уровню риска")
         path = output_dir / "risk_pie.png"
         fig.savefig(path, dpi=160)
         plt.close(fig)
@@ -1703,8 +1985,10 @@ class ReportBuilder:
         rows = self.bank.get_clients_ranking()[currency]
         fig, ax = plt.subplots(figsize=(10, 6), layout="constrained")
         if rows:
-            ax.barh([row["full_name"] for row in rows],
-                    [float(row["total_balance"]) for row in rows], color="#4776a8")
+            positions = list(range(len(rows)))
+            ax.barh(positions, [float(row["total_balance"]) for row in rows], color="#4776a8")
+            ax.set_yticks(positions)
+            ax.set_yticklabels([f'{row["full_name"]} ({row["client_id"][:6]})' for row in rows])
             ax.invert_yaxis()
         else:
             ax.text(0.5, 0.5, "Нет счетов в выбранной валюте", transform=ax.transAxes, ha="center")
@@ -1760,7 +2044,8 @@ def demonstrate_day7(context):
         assert len(rows) == len(list(builder._flatten(report))) + 1
         assert text_path.read_text(encoding="utf-8").startswith("ОТЧЁТ:")
     assert reports["bank"]["transaction_count"] == 40
-    assert sum(reports["risks"]["assessment_counts"].values()) == 40
+    assert (sum(reports["risks"]["assessment_counts"].values())
+            + reports["risks"]["unassessed_transaction_count"]) == 40
     assert builder.balance_history[-1]["totals"] == context["bank"].get_total_balance()
     charts = builder.save_charts(output)
     for path in charts:
